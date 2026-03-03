@@ -16,93 +16,11 @@ import numpy as np
 import gymnasium as gym
 import gymnasium.vector as gym_vector
 
-from robometer.evals.eval_utils import raw_dict_to_sample
+from robometer.evals.eval_utils import raw_dict_to_sample, extract_rewards_from_output, extract_success_probs_from_output
 from robometer.evals.eval_server import process_batch_helper
 from robometer.utils.setup_utils import setup_batch_collator
+from robometer.utils.tensor_utils import t2n
 from robometer.utils.save import load_model_from_hf
-
-
-def extract_rewards_from_output(outputs: Dict[str, Any]) -> np.ndarray:
-    """
-    Extract rewards from the output dictionary returned by process_batch_helper.
-
-    Args:
-        outputs: Dictionary with 'outputs_preference', 'outputs_progress', 'outputs_similarity'
-                 Should contain 'outputs_progress' with 'progress_pred' key
-
-    Returns:
-        numpy array of rewards (one per sample)
-    """
-    if outputs.get("outputs_progress") is None:
-        raise ValueError("No progress outputs found in batch outputs")
-
-    outputs_progress = outputs["outputs_progress"]
-    progress_pred = outputs_progress.get("progress_pred", [])
-
-    # Extract rewards (last value of each progress prediction)
-    # Each progress_list contains progress values for each frame in the subsequence
-    rewards_list = []
-    for progress_list in progress_pred:
-        try:
-            if isinstance(progress_list, list) and len(progress_list) > 0:
-                # The last value is the reward for this subsequence
-                reward = float(progress_list[-1])
-                # Clamp to [0, 1] range
-                reward = max(0.0, min(1.0, reward))
-            else:
-                # Default to 0.0 if no valid prediction
-                reward = 0.0
-        except (ValueError, TypeError, IndexError) as e:
-            reward = 0.0
-        rewards_list.append(reward)
-
-    return np.array(rewards_list, dtype=np.float32)
-
-
-def extract_success_probs_from_output(outputs: Dict[str, Any]) -> np.ndarray:
-    """
-    Extract success probabilities from the output dictionary returned by process_batch_helper.
-
-    Args:
-        outputs: Dictionary with 'outputs_success'
-                 Should contain 'outputs_success' with 'success_probs' key
-
-    Returns:
-        numpy array of success probabilities (one per sample)
-    """
-    if outputs.get("outputs_success") is None:
-        raise ValueError("No success probabilities outputs found in batch outputs")
-
-    outputs_success = outputs["outputs_success"]
-    success_preds = outputs_success.get("success_probs", [])
-    success_probs = []
-    for success_pred in success_preds:
-        try:
-            if isinstance(success_pred, list) and len(success_pred) > 0:
-                # The last value is the success probability for this subsequence
-                success_prob = float(success_pred[-1])
-                success_probs.append(success_prob)
-            else:
-                success_probs.append(0.0)
-        except (ValueError, TypeError, IndexError) as e:
-            success_probs.append(0.0)
-
-    return np.array(success_probs, dtype=np.float32)
-
-
-def _maybe_to_numpy(x: Any) -> Optional[np.ndarray]:
-    if x is None:
-        return None
-    if isinstance(x, np.ndarray):
-        return x
-    try:
-        import torch
-
-        if torch.is_tensor(x):
-            return x.detach().cpu().numpy()
-    except Exception:
-        pass
-    return np.asarray(x)
 
 class GymToGymnasiumWrapper(gym.Env):
     """
@@ -361,7 +279,7 @@ class LiberoRobometerRewardWrapper(gym.Wrapper, _RewardModelInferenceMixin):
         if isinstance(obs, dict):
             for k in self.reward_relabeling_keys:
                 if k in obs:
-                    self._frames[k].append(_maybe_to_numpy(obs[k]))
+                    self._frames[k].append(t2n(obs[k]))
         return obs, info
 
     def step(self, action):
@@ -381,7 +299,7 @@ class LiberoRobometerRewardWrapper(gym.Wrapper, _RewardModelInferenceMixin):
         if isinstance(obs, dict):
             for k in self.reward_relabeling_keys:
                 if k in obs:
-                    self._frames[k].append(_maybe_to_numpy(obs[k]))
+                    self._frames[k].append(t2n(obs[k]))
 
         # Prepare per-key inputs for this timestep
         per_key_rewards: Dict[str, float] = {}
@@ -542,7 +460,7 @@ class VectorLiberoRobometerRewardWrapper(gym_vector.VectorWrapper, _RewardModelI
 
             for k in self.reward_relabeling_keys:
                 if k in obs:
-                    arr = _maybe_to_numpy(obs[k])
+                    arr = t2n(obs[k])
                     if arr is not None and arr.shape[0] == self._n:
                         for i in range(self._n):
                             self._frames[i][k].append(arr[i])
@@ -553,9 +471,9 @@ class VectorLiberoRobometerRewardWrapper(gym_vector.VectorWrapper, _RewardModelI
         obs, env_rewards, terminateds, truncateds, info = self.env.step(actions)
 
         # Normalize arrays
-        env_rewards_np = _maybe_to_numpy(env_rewards)
-        terminateds_np = _maybe_to_numpy(terminateds).astype(bool)
-        truncateds_np = _maybe_to_numpy(truncateds).astype(bool)
+        env_rewards_np = t2n(env_rewards)
+        terminateds_np = t2n(terminateds).astype(bool)
+        truncateds_np = t2n(truncateds).astype(bool)
 
         if env_rewards_np is None:
             env_rewards_np = np.zeros((self._n,), dtype=np.float64)
@@ -584,7 +502,7 @@ class VectorLiberoRobometerRewardWrapper(gym_vector.VectorWrapper, _RewardModelI
             for k in self.reward_relabeling_keys:
                 if k not in obs:
                     continue
-                arr_reset = _maybe_to_numpy(obs[k])
+                arr_reset = t2n(obs[k])
                 if arr_reset is None or arr_reset.shape[0] != self._n:
                     continue
                 for i in range(self._n):
@@ -592,7 +510,7 @@ class VectorLiberoRobometerRewardWrapper(gym_vector.VectorWrapper, _RewardModelI
                     if final_obs is not None and i < len(final_obs) and final_obs[i] is not None:
                         fo_i = final_obs[i]
                         if isinstance(fo_i, dict) and k in fo_i:
-                            frame_i = _maybe_to_numpy(fo_i[k])
+                            frame_i = t2n(fo_i[k])
                     self._frames[i][k].append(frame_i)
 
         # Batch reward computation per key across envs
@@ -686,7 +604,7 @@ class VectorLiberoRobometerRewardWrapper(gym_vector.VectorWrapper, _RewardModelI
                     for k in self.reward_relabeling_keys:
                         if k not in obs:
                             continue
-                        arr_reset = _maybe_to_numpy(obs[k])
+                        arr_reset = t2n(obs[k])
                         if arr_reset is not None and arr_reset.shape[0] == self._n:
                             self._frames[i][k].append(arr_reset[i])
 
