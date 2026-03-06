@@ -14,6 +14,96 @@ import decord
 logger = logging.getLogger(__name__)
 
 
+def _extract_frames_pyav(video_path: str, fps: float, max_frames: int) -> Optional[np.ndarray]:
+    """Fallback: extract frames using PyAV (software decoding). Use conda-forge av for AV1 support."""
+    try:
+        import av
+    except ImportError:
+        return None
+    try:
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            duration_sec = float(stream.duration * stream.time_base) if stream.duration else 0.0
+            try:
+                rate = stream.average_rate
+                native_fps = float(rate) if rate else 30.0
+            except Exception:
+                native_fps = 30.0
+            total_frames = int(round(duration_sec * native_fps)) if duration_sec > 0 else 0
+            if total_frames <= 0:
+                total_frames = sum(1 for _ in container.decode(video=0))
+                container.seek(0)
+            if fps is None or fps <= 0:
+                fps = native_fps
+            if native_fps > 0:
+                desired_frames = int(round(total_frames * (fps / native_fps)))
+            else:
+                desired_frames = total_frames
+            desired_frames = max(1, min(desired_frames, total_frames))
+            if desired_frames > max_frames:
+                desired_frames = max_frames
+            if desired_frames == total_frames:
+                frame_indices = set(range(total_frames))
+            else:
+                frame_indices = set(
+                    np.linspace(0, total_frames - 1, desired_frames, dtype=int).tolist()
+                )
+            frames_list = []
+            for i, frame in enumerate(container.decode(video=0)):
+                if i in frame_indices:
+                    arr = frame.to_ndarray(format="rgb24")
+                    frames_list.append(arr)
+                if len(frames_list) >= len(frame_indices):
+                    break
+            if not frames_list:
+                return None
+            return np.array(frames_list)
+    except Exception:
+        return None
+
+
+def _extract_frames_opencv(video_path: str, fps: float, max_frames: int) -> Optional[np.ndarray]:
+    """Fallback: extract frames using OpenCV. Supports AV1 if built with full FFmpeg."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+        if fps is None or fps <= 0:
+            fps = float(native_fps)
+        if native_fps > 0:
+            desired_frames = int(round(total_frames * (fps / native_fps)))
+        else:
+            desired_frames = total_frames
+        desired_frames = max(1, min(desired_frames, total_frames))
+        if desired_frames > max_frames:
+            desired_frames = max_frames
+        if desired_frames == total_frames:
+            frame_indices = list(range(total_frames))
+        else:
+            frame_indices = np.linspace(0, total_frames - 1, desired_frames, dtype=int).tolist()
+        frames_list = []
+        for i in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames_list.append(frame_rgb)
+        cap.release()
+        if not frames_list:
+            return None
+        return np.array(frames_list)
+    except Exception:
+        cap.release()
+        return None
+
+
 def create_combined_progress_success_plot(
     progress_pred: np.ndarray,
     num_frames: int,
@@ -141,6 +231,9 @@ def extract_frames(video_path: str, fps: float = 1.0, max_frames: int = 64) -> n
 
     Returns:
         numpy array of shape (T, H, W, C) containing extracted frames, or None if error
+
+    Decoder fallback order: Decord (fast, H.264/H.265) → PyAV (software AV1 if installed,
+    e.g. ``pip install av`` or ``conda install -c conda-forge av``) → OpenCV.
     """
     if video_path is None:
         return None
@@ -157,7 +250,7 @@ def extract_frames(video_path: str, fps: float = 1.0, max_frames: int = 64) -> n
         return None
 
     try:
-        # decord.VideoReader can handle both local files and URLs
+        # decord.VideoReader can handle both local files and URLs (H.264/H.265 typical)
         vr = decord.VideoReader(video_path, num_threads=1)
         total_frames = len(vr)
 
@@ -201,5 +294,16 @@ def extract_frames(video_path: str, fps: float = 1.0, max_frames: int = 64) -> n
         del vr
         return frames_array
     except Exception as e:
+        logger.warning(
+            f"Decord failed to read {video_path} (e.g. AV1/other codec not supported): {e}. "
+            "Trying PyAV then OpenCV fallback."
+        )
+        # PyAV (conda-forge av) often ships with FFmpeg + libdav1d for software AV1 decode
+        frames_array = _extract_frames_pyav(video_path, fps, max_frames)
+        if frames_array is not None:
+            return frames_array
+        frames_array = _extract_frames_opencv(video_path, fps, max_frames)
+        if frames_array is not None:
+            return frames_array
         logger.error(f"Error extracting frames from {video_path}: {e}")
         return None

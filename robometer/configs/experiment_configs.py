@@ -5,9 +5,17 @@ This file contains all the dataclass configurations that can be reused
 across different training scripts.
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field, fields
+from typing import Optional, Dict, Any, List, Type
 from transformers import PretrainedConfig
+
+
+def _filter_to_config_keys(d: Dict[str, Any], config_class: Type[Any]) -> Dict[str, Any]:
+    """Return only keys that the config dataclass accepts (for loading YAML/HF configs with extra keys)."""
+    if not isinstance(d, dict):
+        return d
+    valid = {f.name for f in fields(config_class)}
+    return {k: v for k, v in d.items() if k in valid}
 
 
 @dataclass
@@ -82,6 +90,14 @@ class ModelConfig(PretrainedConfig):
     progress_discrete_bins: Optional[int] = field(
         default=None,
         metadata={"help": "Number of discrete bins for progress when using discrete loss (None for continuous)"},
+    )
+    causal_mask: bool = field(
+        default=False,
+        metadata={"help": "Use causal masking in ReWiND / attention (saved in some HF checkpoints)."},
+    )
+    rewind_scale_model: Optional[float] = field(
+        default=None,
+        metadata={"help": "Scale for rewind model (saved in some HF checkpoints)."},
     )
     # rewind sub-config
     rewind: Optional[Dict[str, Any]] = field(default=None)
@@ -533,30 +549,30 @@ class ExperimentConfig:
 
     def __post_init__(self):
         if isinstance(self.loss, dict):
-            self.loss = LossConfig(**self.loss)
+            self.loss = LossConfig(**_filter_to_config_keys(self.loss, LossConfig))
 
         if isinstance(self.model, dict):
-            self.model = ModelConfig(**self.model)
+            self.model = ModelConfig(**_filter_to_config_keys(self.model, ModelConfig))
 
         if isinstance(self.peft, dict):
-            self.peft = PEFTConfig(**self.peft)
+            self.peft = PEFTConfig(**_filter_to_config_keys(self.peft, PEFTConfig))
 
         if isinstance(self.data, dict):
             self.data.pop("roboarena_partial_success_threshold", None)
-            self.data = DataConfig(**self.data)
+            self.data = DataConfig(**_filter_to_config_keys(self.data, DataConfig))
 
         if isinstance(self.training, dict):
-            self.training = TrainingConfig(**self.training)
+            self.training = TrainingConfig(**_filter_to_config_keys(self.training, TrainingConfig))
 
         if isinstance(self.logging, dict):
-            self.logging = LoggingConfig(**self.logging)
+            self.logging = LoggingConfig(**_filter_to_config_keys(self.logging, LoggingConfig))
 
         # Handle nested SaveBestConfig in LoggingConfig
         if hasattr(self.logging, "save_best") and isinstance(self.logging.save_best, dict):
-            self.logging.save_best = SaveBestConfig(**self.logging.save_best)
+            self.logging.save_best = SaveBestConfig(**_filter_to_config_keys(self.logging.save_best, SaveBestConfig))
         elif self.logging.save_best is None:
             # Set default SaveBestConfig if not provided
             self.logging.save_best = SaveBestConfig()
 
         if isinstance(self.custom_eval, dict):
-            self.custom_eval = CustomEvaluationConfig(**self.custom_eval)
+            self.custom_eval = CustomEvaluationConfig(**_filter_to_config_keys(self.custom_eval, CustomEvaluationConfig))

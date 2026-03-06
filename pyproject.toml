@@ -111,6 +111,10 @@ vlac = [
     "trl>=0.13,<0.17",  # Required by evo-vlac
     "evo-vlac @ git+https://github.com/InternRobotics/VLAC.git",
 ]
+# AV1 and other codecs: PyAV with software decoding (e.g. conda install -c conda-forge av)
+video-av1 = [
+    "av>=14.0.0",
+]
 
 # ==================================================================================
 # Build System

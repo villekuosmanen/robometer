@@ -120,6 +120,11 @@ class RBM(PredictionHeadsMixin, PreTrainedModel):
                 "Please set data.use_multi_image=True to use Molmo2 with multi-image input."
             )
 
+        # Newer transformers (e.g. 4.57+) expect all_tied_weights_keys in _finalize_model_loading;
+        # it is normally set in PreTrainedModel.post_init(), which is not always called during from_pretrained.
+        if not getattr(self, "all_tied_weights_keys", None):
+            self.all_tied_weights_keys = {}
+
     def gradient_checkpointing_enable(self, **kwargs):
         """Delegates gradient checkpointing enabling to the base model."""
         self.model.gradient_checkpointing_enable(**kwargs)
