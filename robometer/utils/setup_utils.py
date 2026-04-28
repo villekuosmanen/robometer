@@ -6,15 +6,14 @@ This file contains setup functions that can be reused across different training 
 
 from unsloth import FastVisionModel
 
-import re
+import json
 import os
 from pathlib import Path
 from typing import Tuple, Optional, Any
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 from peft import LoraConfig, get_peft_model, PeftModel
-import bitsandbytes as bnb
-from huggingface_hub import HfApi
 from transformers import (
     AutoImageProcessor,
     AutoModel,
@@ -52,15 +51,147 @@ from robometer.data.datasets import (
     RepeatedDataset,
 )
 from robometer.data.datasets.custom_eval import CustomEvalDataset
-from robometer.models import RBM, ReWiNDTransformer, ReWINDTransformerConfig
+from robometer.models import RBM, ReWiNDTransformer
 from robometer.utils.logger import get_logger
 
 logger = get_logger()
 from robometer.utils.save import parse_hf_model_id_and_revision, resolve_checkpoint_path
 
 
+def _get_rbm_peft_target(rbm_model: RBM) -> tuple[Optional[str], Optional[PeftModel]]:
+    """Return the PEFT-wrapped RBM component, if any."""
+    root = getattr(rbm_model, "model", None)
+    if isinstance(root, PeftModel):
+        return "model", root
+
+    language_model = getattr(root, "language_model", None)
+    if isinstance(language_model, PeftModel):
+        return "language_model", language_model
+
+    visual = getattr(root, "visual", None)
+    if isinstance(visual, PeftModel):
+        return "visual", visual
+
+    return None, None
+
+
+def model_has_peft(rbm_model: RBM) -> bool:
+    """Whether any RBM submodule is currently PEFT-wrapped."""
+    return _get_rbm_peft_target(rbm_model)[1] is not None
+
+
+def _infer_peft_target_from_keys(keys: list[str]) -> Optional[str]:
+    """Infer which RBM submodule owns the adapter keys."""
+    adapter_keys = [k for k in keys if "lora_A" in k or "lora_B" in k]
+    if not adapter_keys:
+        return None
+
+    for key in adapter_keys:
+        if ".language_model." in key:
+            return "language_model"
+        if ".visual." in key:
+            return "visual"
+    return "model"
+
+
+def _inspect_checkpoint_for_peft(checkpoint_path: str) -> dict[str, Any]:
+    """Inspect a checkpoint directory for PEFT adapter artifacts or embedded adapter weights."""
+    path = Path(checkpoint_path)
+    info = {
+        "has_adapter_files": False,
+        "has_adapter_weights": False,
+        "target_module": None,
+        "adapter_load_path": str(path),
+    }
+
+    meta_path = path / "peft_target_module.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        info["target_module"] = meta.get("target_module")
+        adapter_dir = meta.get("adapter_dir", ".")
+        info["adapter_load_path"] = str(path / adapter_dir) if adapter_dir != "." else str(path)
+
+    adapter_candidates = [
+        (path, "model"),
+        (path / "language_model_adapter", "language_model"),
+        (path / "visual_adapter", "visual"),
+    ]
+    for adapter_dir, target in adapter_candidates:
+        adapter_config = adapter_dir / "adapter_config.json"
+        adapter_model_paths = [
+            adapter_dir / "adapter_model.safetensors",
+            adapter_dir / "adapter_model.bin",
+        ]
+        if adapter_config.exists() and any(p.exists() for p in adapter_model_paths):
+            info["has_adapter_files"] = True
+            info["has_adapter_weights"] = True
+            info["target_module"] = info["target_module"] or target
+            info["adapter_load_path"] = str(adapter_dir)
+            return info
+
+    keys: list[str] = []
+    index_path = path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            index_data = json.load(f)
+        keys.extend(index_data.get("weight_map", {}).keys())
+    else:
+        for safetensors_path in path.glob("*.safetensors"):
+            try:
+                with safe_open(str(safetensors_path), framework="pt", device="cpu") as f:
+                    keys.extend(list(f.keys()))
+            except Exception:
+                continue
+
+    info["target_module"] = info["target_module"] or _infer_peft_target_from_keys(keys)
+    info["has_adapter_weights"] = info["target_module"] is not None
+    return info
+
+
+def _get_checkpoint_safetensors_files(checkpoint_path: Path, prefer_model_shards: bool = False) -> list[Path]:
+    """Return checkpoint safetensors files, optionally preferring full model shards over sidecar adapter files."""
+    if prefer_model_shards:
+        index_path = checkpoint_path / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                index_data = json.load(f)
+            weight_files = sorted(set(index_data.get("weight_map", {}).values()))
+            indexed_files = [checkpoint_path / name for name in weight_files if (checkpoint_path / name).exists()]
+            if indexed_files:
+                return indexed_files
+
+        model_shards = sorted(checkpoint_path.glob("model*.safetensors"))
+        if model_shards:
+            return model_shards
+
+    return sorted(checkpoint_path.glob("*.safetensors"))
+
+
+def _checkpoint_has_full_model_shards(checkpoint_path: str) -> bool:
+    """Whether a checkpoint directory contains self-contained model safetensors shards."""
+    path = Path(checkpoint_path)
+    return (path / "model.safetensors.index.json").exists() or any(path.glob("model*.safetensors"))
+
+
+def _load_custom_heads_from_safetensors(model: RBM, checkpoint_path: str) -> bool:
+    """Load custom RBM heads from a dedicated safetensors file if present."""
+    custom_heads_path = Path(checkpoint_path) / "custom_heads.safetensors"
+    if not custom_heads_path.exists():
+        return False
+
+    custom_state = load_file(str(custom_heads_path))
+    model.load_state_dict(custom_state, strict=False)
+    logger.info(f"Loaded {len(custom_state)} custom head tensors from {custom_heads_path}")
+    return True
+
+
 def _load_checkpoint_weights_from_safetensors(
-    model, checkpoint_path: str, cfg: ModelConfig, load_adapters: bool = True
+    model,
+    checkpoint_path: str,
+    cfg: ModelConfig,
+    load_adapters: bool = True,
+    prefer_model_shards: bool = False,
 ) -> None:
     """
     Load checkpoint weights from safetensors files in a checkpoint directory.
@@ -83,8 +214,12 @@ def _load_checkpoint_weights_from_safetensors(
     if not checkpoint_path.is_dir():
         raise ValueError(f"Checkpoint path is not a directory: {checkpoint_path}")
 
-    # Collect all safetensors files
-    safetensors_files = list(checkpoint_path.glob("*.safetensors"))
+    # Collect safetensors files. For self-contained checkpoints, prefer model shards and
+    # ignore sidecar adapter/custom-head files that may duplicate the same weights.
+    safetensors_files = _get_checkpoint_safetensors_files(
+        checkpoint_path,
+        prefer_model_shards=prefer_model_shards,
+    )
     if not safetensors_files:
         raise ValueError(f"No safetensors files found in checkpoint directory: {checkpoint_path}")
 
@@ -717,7 +852,7 @@ def setup_model_and_processor(
         bnb = None
 
     try:
-        import flash_attn
+        import flash_attn  # noqa: F401
 
         logger.info("Flash Attention 2 CUDA is available")
         has_flash_attn = True
@@ -730,30 +865,34 @@ def setup_model_and_processor(
     else:
         extra_kwargs = {"attn_implementation": "sdpa"}
 
-    # Determine if we're loading from a checkpoint and whether it has PEFT adapter files
+    # Determine if we're loading from a checkpoint and inspect any PEFT artifacts/weights.
     loading_from_checkpoint = bool(hf_model_id)
     checkpoint_path_for_load: Optional[str] = None
-    has_adapter_files = True  # default when not loading
+    checkpoint_peft_info = {
+        "has_adapter_files": False,
+        "has_adapter_weights": False,
+        "target_module": None,
+        "adapter_load_path": None,
+    }
     if hf_model_id:
         hub_token = os.environ.get("HF_TOKEN")
         checkpoint_path_for_load = resolve_checkpoint_path(hf_model_id, hub_token=hub_token)
         if checkpoint_path_for_load:
-            adapter_config_path = os.path.join(checkpoint_path_for_load, "adapter_config.json")
-            adapter_model_paths = [
-                os.path.join(checkpoint_path_for_load, "adapter_model.safetensors"),
-                os.path.join(checkpoint_path_for_load, "adapter_model.bin"),
-            ]
-            has_adapter_files = os.path.exists(adapter_config_path) and any(
-                os.path.exists(p) for p in adapter_model_paths
-            )
-            if cfg.use_peft and not has_adapter_files:
-                logger.info(
-                    "Checkpoint has no PEFT adapter files; will load base+heads then add PEFT in train.py"
-                )
-        else:
-            has_adapter_files = True  # treat as True so we don't skip PEFT
-    # When loading from checkpoint without adapters but use_peft: build base without PEFT, load weights, then train.py adds PEFT
-    apply_peft_before_wrap = cfg.use_peft and (not hf_model_id or has_adapter_files)
+            checkpoint_peft_info = _inspect_checkpoint_for_peft(checkpoint_path_for_load)
+            if cfg.use_peft:
+                if checkpoint_peft_info["has_adapter_files"]:
+                    logger.info(
+                        f"Checkpoint contains standalone PEFT adapter files for target "
+                        f"{checkpoint_peft_info['target_module']}"
+                    )
+                elif checkpoint_peft_info["has_adapter_weights"]:
+                    logger.info(
+                        f"Checkpoint stores PEFT weights inside safetensors for target "
+                        f"{checkpoint_peft_info['target_module']}; will reconstruct PEFT before loading"
+                    )
+
+    # For checkpoint loading, attach PEFT after wrapping in RBM so nested adapter layouts are preserved.
+    apply_peft_before_wrap = cfg.use_peft and not loading_from_checkpoint
 
     # Load processor and tokenizer
     if "SmolVLM" in cfg.base_model_id or "Qwen" in cfg.base_model_id or "Molmo" in cfg.base_model_id:
@@ -856,31 +995,83 @@ def setup_model_and_processor(
             if checkpoint_path is None:
                 raise ValueError(f"Could not resolve checkpoint path: {hf_model_id}")
 
-            # When use_peft and checkpoint has adapter files: load via PeftModel.from_pretrained + custom heads
-            # When use_peft and checkpoint has NO adapter files: we built base without PEFT; load weights only; train.py will add PEFT
             if cfg.use_peft:
-                if has_adapter_files:
-                    logger.info("Loading PEFT adapters using standard PeftModel.from_pretrained() method")
-                    if not isinstance(model.model, PeftModel):
-                        logger.error("CRITICAL: model.model is not a PeftModel! Cannot load adapter weights.")
-                        raise ValueError(
-                            "model.model is not a PeftModel. "
-                            "This should not happen if PEFT was applied correctly before wrapping in RBM."
-                        )
-                    logger.info("Checkpoint contains PEFT adapter files - loading using PeftModel.from_pretrained()")
+                checkpoint_target = checkpoint_peft_info["target_module"] or (
+                    "visual" if peft_config and peft_config.peft_vision_encoder else "language_model"
+                )
+                has_adapter_files = checkpoint_peft_info["has_adapter_files"]
+                has_adapter_weights = checkpoint_peft_info["has_adapter_weights"]
+                adapter_load_path = checkpoint_peft_info["adapter_load_path"] or checkpoint_path
+
+                if has_adapter_weights and not has_adapter_files and not model_has_peft(model):
+                    if peft_config is None:
+                        raise ValueError("PEFT is enabled but peft_config is None. Cannot reconstruct adapters.")
+                    logger.info(f"Attaching PEFT to target '{checkpoint_target}' before loading checkpoint")
+                    model = setup_peft_model(model, peft_config, target_module=checkpoint_target)
+
+                if _checkpoint_has_full_model_shards(checkpoint_path):
+                    logger.info(
+                        "Checkpoint includes full model safetensors shards; "
+                        "preferring embedded full weights over standalone adapter files"
+                    )
+                    _load_checkpoint_weights_from_safetensors(
+                        model,
+                        checkpoint_path,
+                        cfg,
+                        load_adapters=True,
+                        prefer_model_shards=True,
+                    )
+                elif has_adapter_files:
+                    logger.info(
+                        f"Loading PEFT adapters from {adapter_load_path} into RBM target '{checkpoint_target}'"
+                    )
                     try:
-                        model.model = PeftModel.from_pretrained(model.model, checkpoint_path)
+                        if checkpoint_target == "model":
+                            model.model = PeftModel.from_pretrained(model.model, adapter_load_path)
+                        elif checkpoint_target == "visual":
+                            model.model.visual = PeftModel.from_pretrained(model.model.visual, adapter_load_path)
+                        else:
+                            model.model.language_model = PeftModel.from_pretrained(
+                                model.model.language_model, adapter_load_path
+                            )
                         logger.info("Successfully loaded PEFT adapters using PeftModel.from_pretrained()")
-                        logger.info("Loading custom heads only (adapters already loaded)")
-                        _load_checkpoint_weights_from_safetensors(model, checkpoint_path, cfg, load_adapters=False)
+                        if not _load_custom_heads_from_safetensors(model, checkpoint_path):
+                            logger.info("No custom_heads.safetensors found; falling back to generic safetensors loader")
+                            _load_checkpoint_weights_from_safetensors(
+                                model,
+                                checkpoint_path,
+                                cfg,
+                                load_adapters=False,
+                                prefer_model_shards=True,
+                            )
                     except Exception as e:
                         logger.warning(f"PeftModel.from_pretrained() failed: {e}")
                         logger.info("Falling back to manual loading for all weights")
-                        _load_checkpoint_weights_from_safetensors(model, checkpoint_path, cfg, load_adapters=True)
+                        _load_checkpoint_weights_from_safetensors(
+                            model,
+                            checkpoint_path,
+                            cfg,
+                            load_adapters=True,
+                            prefer_model_shards=True,
+                        )
+                elif has_adapter_weights:
+                    logger.info("Checkpoint has embedded PEFT weights but no standalone adapter files")
+                    _load_checkpoint_weights_from_safetensors(
+                        model,
+                        checkpoint_path,
+                        cfg,
+                        load_adapters=True,
+                        prefer_model_shards=True,
+                    )
                 else:
-                    # Checkpoint has no adapter files; we built base without PEFT, load base+heads only; train.py will add PEFT
-                    logger.info("Checkpoint has no PEFT adapter files - loading base + custom heads (PEFT will be added in train.py)")
-                    _load_checkpoint_weights_from_safetensors(model, checkpoint_path, cfg, load_adapters=True)
+                    logger.info("Checkpoint has no PEFT adapter weights - loading plain model weights")
+                    _load_checkpoint_weights_from_safetensors(
+                        model,
+                        checkpoint_path,
+                        cfg,
+                        load_adapters=True,
+                        prefer_model_shards=True,
+                    )
             else:
                 # For non-PEFT models, we can use from_pretrained as before
                 # Capture before weights for verification
@@ -1039,7 +1230,7 @@ def _get_vl_inner_model(rbm_model: RBM):
     return m
 
 
-def setup_peft_model(rbm_model: RBM, cfg: PEFTConfig) -> RBM:
+def setup_peft_model(rbm_model: RBM, cfg: PEFTConfig, target_module: Optional[str] = None) -> RBM:
     """Shared function to apply PEFT configuration to the model."""
 
     logger.info("Using PEFT/LoRA training...")
@@ -1050,12 +1241,15 @@ def setup_peft_model(rbm_model: RBM, cfg: PEFTConfig) -> RBM:
         lora_dropout=cfg.lora_dropout,
         bias=cfg.bias,
     )
+    target_module = target_module or ("visual" if cfg.peft_vision_encoder else "language_model")
     inner = _get_vl_inner_model(rbm_model)
-    if cfg.peft_vision_encoder:
+    if target_module == "model":
+        logger.info("Attaching LoRA to the whole VL backbone...")
+        rbm_model.model = get_peft_model(rbm_model.model, lora_config)
+    elif target_module == "visual":
         logger.info("Attaching LoRA to the vision encoder...")
         inner.visual = get_peft_model(inner.visual, lora_config)
     else:
-        # Default: attach LoRA to the language model so adapter weights are actually added
         logger.info("Attaching LoRA to the language model...")
         inner.language_model = get_peft_model(inner.language_model, lora_config)
 

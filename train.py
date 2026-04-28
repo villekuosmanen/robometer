@@ -39,6 +39,7 @@ from robometer.utils.save import (
 )
 from robometer.utils.setup_utils import (
     create_training_arguments,
+    model_has_peft,
     setup_batch_collator,
     setup_dataset,
     setup_model_and_processor,
@@ -104,7 +105,11 @@ def train(cfg: ExperimentConfig):
 
     # Apply PEFT if enabled
     if cfg.model.use_peft:
-        peft_rbm_model = setup_peft_model(rbm_model, cfg.peft)
+        if model_has_peft(rbm_model):
+            peft_rbm_model = rbm_model
+            rank_0_info("PEFT already configured on the model; skipping re-application.")
+        else:
+            peft_rbm_model = setup_peft_model(rbm_model, cfg.peft)
     else:
         peft_rbm_model = rbm_model
         rank_0_info("PEFT not enabled, using full model")
