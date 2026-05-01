@@ -1,32 +1,165 @@
+import gc
+import json
 import os
 import re
 import shutil
-import json
-from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from dataclasses import fields
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 import numpy as np
-import gc
 import torch
-from transformers import TrainerCallback, TrainerState, TrainerControl, TrainingArguments, Trainer
-from transformers.trainer_utils import get_last_checkpoint
+import yaml
 from accelerate.state import AcceleratorState
 from huggingface_hub import HfApi, snapshot_download
-from huggingface_hub.utils import HfHubHTTPError
 from peft import PeftModel
-from .upload_to_hub import upload_model_to_hub
+from transformers import Trainer, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+
+from robometer.configs.experiment_configs import (
+    DataConfig,
+    ExperimentConfig,
+    LossConfig,
+    ModelConfig,
+)
 from robometer.utils.distributed import is_rank_0
 from robometer.utils.logger import loguru_logger as logger
-from robometer.configs.experiment_configs import (
-    ExperimentConfig,
-    ModelConfig,
-    LossConfig,
-    DataConfig,
-)
-from pathlib import Path
-from dataclasses import fields
-from typing import Any, Optional, Tuple
-import yaml
+
+from .upload_to_hub import upload_model_to_hub
+
+
+def _get_rbm_peft_target(model: Any) -> tuple[str | None, PeftModel | None]:
+    """Return the PEFT-wrapped RBM component, if any."""
+    root = getattr(model, "model", None)
+    if isinstance(root, PeftModel):
+        return "model", root
+
+    language_model = getattr(root, "language_model", None)
+    if isinstance(language_model, PeftModel):
+        return "language_model", language_model
+
+    visual = getattr(root, "visual", None)
+    if isinstance(visual, PeftModel):
+        return "visual", visual
+
+    return None, None
+
+
+def _save_training_random_state(trainer: Trainer, ckpt_dir: str) -> None:
+    """Save dataset random state when available."""
+    if hasattr(trainer, "train_dataset"):
+        try:
+            train_dataset = trainer.train_dataset
+            if hasattr(train_dataset, "dataset"):
+                train_dataset = train_dataset.dataset
+
+            if hasattr(train_dataset, "get_random_state"):
+                random_state = train_dataset.get_random_state()
+                random_state_file = os.path.join(ckpt_dir, "dataset_random_state.json")
+                with open(random_state_file, "w") as f:
+                    json.dump(random_state, f, indent=2)
+                logger.info(f"Saved dataset random state to {random_state_file}")
+        except Exception as e:
+            logger.warning(f"Could not save random state: {e}")
+
+
+def _save_trainer_checkpoint_files(
+    trainer: Trainer,
+    args: TrainingArguments,
+    ckpt_dir: str,
+    metrics: dict | None = None,
+    step: int | None = None,
+) -> None:
+    """Save a trainer checkpoint, including PEFT adapters and RBM heads when present."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    model = trainer.model
+    peft_target, peft_module = _get_rbm_peft_target(model)
+
+    if peft_module is not None:
+        logger.info(f"Detected PEFT target '{peft_target}' - saving full model snapshot and adapter metadata")
+        trainer.save_model(ckpt_dir)
+        peft_module.save_pretrained(ckpt_dir)
+
+        peft_meta_path = os.path.join(ckpt_dir, "peft_target_module.json")
+        with open(peft_meta_path, "w") as f:
+            json.dump({"target_module": peft_target, "adapter_dir": "."}, f, indent=2)
+        logger.info(f"Saved PEFT target metadata to {peft_meta_path}")
+
+        rbm_state_dict = {}
+        for name, param in model.named_parameters():
+            if (
+                "progress_head" in name
+                or "preference_head" in name
+                or "similarity_head" in name
+                or "success_head" in name
+            ):
+                rbm_state_dict[name] = param.data.cpu()
+            elif "frame_pool_attn" in name or "video_proj" in name or "text_proj" in name:
+                rbm_state_dict[name] = param.data.cpu()
+
+        for name, buffer in model.named_buffers():
+            if (
+                "progress_head" in name
+                or "preference_head" in name
+                or "similarity_head" in name
+                or "success_head" in name
+            ):
+                rbm_state_dict[name] = buffer.cpu()
+
+        if rbm_state_dict:
+            from safetensors.torch import save_file
+
+            custom_heads_path = os.path.join(ckpt_dir, "custom_heads.safetensors")
+            save_file(rbm_state_dict, custom_heads_path)
+            logger.info(f"Saved {len(rbm_state_dict)} custom head parameters to {custom_heads_path}")
+
+        adapter_config_path = os.path.join(ckpt_dir, "adapter_config.json")
+        adapter_model_paths = [
+            os.path.join(ckpt_dir, "adapter_model.safetensors"),
+            os.path.join(ckpt_dir, "adapter_model.bin"),
+        ]
+
+        if os.path.exists(adapter_config_path):
+            logger.info(f"PEFT adapter config saved to {adapter_config_path}")
+        else:
+            logger.warning(f"PEFT adapter config not found at {adapter_config_path}")
+
+        adapter_model_found = any(os.path.exists(p) for p in adapter_model_paths)
+        if adapter_model_found:
+            adapter_path = next(p for p in adapter_model_paths if os.path.exists(p))
+            logger.info(f"PEFT adapter weights saved to {adapter_path}")
+        else:
+            logger.warning("PEFT adapter weights file not found - adapter weights may not have been saved correctly")
+    else:
+        logger.info("Detected non-PEFT model - using standard save_model()")
+        trainer.save_model(ckpt_dir)
+
+    if args.should_save:
+        os.makedirs(args.output_dir, exist_ok=True)
+        trainer.save_state()
+        trainer_state_src = os.path.join(args.output_dir, "trainer_state.json")
+        if os.path.exists(trainer_state_src):
+            shutil.copy(trainer_state_src, ckpt_dir)
+
+    if metrics is not None:
+        metrics_file = os.path.join(ckpt_dir, "metrics.json")
+        metrics_to_save = {
+            "step": step,
+            "metrics": {k: float(v) if isinstance(v, (int, float, np.number)) else str(v) for k, v in metrics.items()},
+        }
+        with open(metrics_file, "w") as f:
+            json.dump(metrics_to_save, f, indent=2)
+        logger.info(f"📊 Saved metrics to {metrics_file}")
+
+    _save_training_random_state(trainer, ckpt_dir)
+
+
+def save_final_checkpoint(
+    trainer: Trainer, ckpt_dir: str, metrics: dict | None = None, step: int | None = None
+) -> None:
+    """Public helper for the final training save path."""
+    _save_trainer_checkpoint_files(trainer, trainer.args, ckpt_dir, metrics=metrics, step=step)
 
 
 def _apply_loaded_section_to_dataclass(instance: Any, loaded: dict, valid_names: set) -> None:
@@ -38,7 +171,7 @@ def _apply_loaded_section_to_dataclass(instance: Any, loaded: dict, valid_names:
 
 def update_cfg_with_pretrained_ckpt(
     cfg: ExperimentConfig,
-    resume_from_checkpoint: Optional[str],
+    resume_from_checkpoint: str | None,
 ) -> None:
     """
     When resuming from a HuggingFace (or local) checkpoint, load its config.yaml
@@ -50,7 +183,7 @@ def update_cfg_with_pretrained_ckpt(
 
     hub_token = os.environ.get("HF_TOKEN")
     is_hub = "/" in resume_from_checkpoint and not resume_from_checkpoint.startswith(("/", "./", "../"))
-    config_path: Optional[str] = None
+    config_path: str | None = None
 
     if is_hub:
         repo_id, revision = parse_hf_model_id_and_revision(resume_from_checkpoint, model_name="checkpoint")
@@ -81,11 +214,11 @@ def update_cfg_with_pretrained_ckpt(
     if not isinstance(loaded, dict):
         return
 
-    # Replace entire model config except use_peft (keep current run's choice); only sync progress-loss + use_multi_image for loss and data
+    # Replace the model config except use_peft; sync only the progress-loss and multi-image fields.
     model_names = {f.name for f in fields(ModelConfig)} - {"use_peft"}
     progress_loss_fields = {"progress_loss_type", "progress_discrete_bins"}
     loss_names = progress_loss_fields & {f.name for f in fields(LossConfig)}
-    data_sync_fields = progress_loss_fields | {"use_multi_image", "use_per_frame_progress_token"} 
+    data_sync_fields = progress_loss_fields | {"use_multi_image", "use_per_frame_progress_token"}
     data_names = data_sync_fields & {f.name for f in fields(DataConfig)}
 
     model_loaded = loaded.get("model")
@@ -101,10 +234,11 @@ def update_cfg_with_pretrained_ckpt(
         _apply_loaded_section_to_dataclass(cfg.data, data_loaded, data_names)
     if loss_names or data_names:
         logger.info(
-            "Updated from checkpoint: progress_loss_type, progress_discrete_bins (loss); progress_loss_type, progress_discrete_bins, use_multi_image (data)"
+            "Updated from checkpoint: progress_loss_type, progress_discrete_bins (loss); "
+            "progress_loss_type, progress_discrete_bins, use_multi_image (data)"
         )
 
-def resolve_checkpoint_path(checkpoint_path: Optional[str], hub_token: Optional[str] = None) -> Optional[str]:
+def resolve_checkpoint_path(checkpoint_path: str | None, hub_token: str | None = None) -> str | None:
     """
     Resolve checkpoint path, supporting local paths and HuggingFace Hub with @ notation.
 
@@ -147,7 +281,7 @@ def resolve_checkpoint_path(checkpoint_path: Optional[str], hub_token: Optional[
     return checkpoint_path
 
 
-def parse_hf_model_id_and_revision(hf_model_id: str, model_name: str = "model") -> Tuple[str, Optional[str]]:
+def parse_hf_model_id_and_revision(hf_model_id: str, model_name: str = "model") -> tuple[str, str | None]:
     """
     Parse HuggingFace model ID and determine which revision (tag) to load.
 
@@ -188,7 +322,7 @@ def parse_hf_model_id_and_revision(hf_model_id: str, model_name: str = "model") 
     return repo_id, revision_to_load
 
 
-def find_best_model_tag(hf_model_id: str, hub_token: Optional[str] = None) -> Tuple[Optional[str], Optional[float]]:
+def find_best_model_tag(hf_model_id: str, hub_token: str | None = None) -> tuple[str | None, float | None]:
     """
     Find the best model tag from HuggingFace Hub by parsing tag names and extracting scores.
 
@@ -269,13 +403,13 @@ class SaveBestCallback(TrainerCallback):
 
     def __init__(
         self,
-        metric_names: List[str] = None,
-        greater_is_better: List[bool] = None,
+        metric_names: list[str] | None = None,
+        greater_is_better: list[bool] | None = None,
         keep_top_k: int = 1,
-        save_every: Optional[int] = None,
+        save_every: int | None = None,
         upload_to_hub: bool = False,
-        hub_save_every: Optional[int] = None,
-        hub_token: Optional[str] = None,
+        hub_save_every: int | None = None,
+        hub_token: str | None = None,
         hub_private: bool = False,
         base_model: str = "Qwen/Qwen2.5-VL-3B-Instruct",
     ):
@@ -286,7 +420,8 @@ class SaveBestCallback(TrainerCallback):
         # Validate inputs
         if len(self.metric_names) != len(self.greater_is_better):
             raise ValueError(
-                f"metric_names ({len(self.metric_names)}) and greater_is_better ({len(self.greater_is_better)}) must have the same length"
+                f"metric_names ({len(self.metric_names)}) and greater_is_better "
+                f"({len(self.greater_is_better)}) must have the same length"
             )
         self.keep_top_k = keep_top_k
         self.save_every = save_every
@@ -296,9 +431,9 @@ class SaveBestCallback(TrainerCallback):
         self.hub_private = hub_private
         self.base_model = base_model
         self._best_val = None
-        self._saved: List[Tuple[float, str]] = []  # list of (score, path), sorted from best -> worst
-        self._uploaded: List[
-            Tuple[float, str, str]
+        self._saved: list[tuple[float, str]] = []  # list of (score, path), sorted from best -> worst
+        self._uploaded: list[
+            tuple[float, str, str]
         ] = []  # list of (score, tag_name, commit_id), sorted from best -> worst
         self._trainer = None  # Will be set when callback is registered
         self._last_save_step = -1  # Track last step where we saved 'latest'
@@ -313,7 +448,7 @@ class SaveBestCallback(TrainerCallback):
         """Set the trainer reference for later use in callbacks"""
         self._trainer = trainer
 
-    def _compute_averaged_score(self, metrics: dict) -> Tuple[float, List[str]]:
+    def _compute_averaged_score(self, metrics: dict) -> tuple[float, list[str]]:
         """
         Compute averaged score from multiple metrics.
 
@@ -323,7 +458,7 @@ class SaveBestCallback(TrainerCallback):
         available_scores = []
         missing_metrics = []
 
-        for metric_name, is_better in zip(self.metric_names, self.greater_is_better):
+        for metric_name, is_better in zip(self.metric_names, self.greater_is_better, strict=False):
             if metric_name in metrics:
                 score = float(metrics[metric_name])
                 # Normalize score: if lower is better, negate it so higher normalized score is better
@@ -341,7 +476,7 @@ class SaveBestCallback(TrainerCallback):
     def _is_main_process(self, trainer: Trainer) -> bool:
         try:
             return trainer.is_world_process_zero() and is_rank_0()
-        except:
+        except Exception:
             return (not AcceleratorState().distributed_type) or AcceleratorState().is_main_process
 
     def _build_metric_short_name(self) -> str:
@@ -381,7 +516,13 @@ class SaveBestCallback(TrainerCallback):
         tag_name = tag_name.strip("-")
         return tag_name
 
-    def _save_checkpoint_files(self, args: TrainingArguments, ckpt_dir: str, metrics: dict = None, step: int = None):
+    def _save_checkpoint_files(
+        self,
+        args: TrainingArguments,
+        ckpt_dir: str,
+        metrics: dict | None = None,
+        step: int | None = None,
+    ):
         """Save model, trainer state files, and metrics.
 
         For PEFT models, uses standard PeftModel.save_pretrained() to save adapter weights.
@@ -389,136 +530,7 @@ class SaveBestCallback(TrainerCallback):
 
         Note: This should only be called from rank 0 in the current implementation.
         """
-        model = self._trainer.model
-
-        # Unwrap DDP/FSDP/accelerate wrappers if present (they expose `.module`, not `.model`)
-        inner_model = model
-        while hasattr(inner_model, "module") and not hasattr(inner_model, "model"):
-            inner_model = inner_model.module
-
-        # Locate the actual PeftModel submodule. Depending on how PEFT was attached
-        # (see setup_peft_model / apply_peft_before_wrap), the PeftModel may live at
-        # one of three locations.
-        peft_module = None
-        if hasattr(inner_model, "model"):
-            vl = inner_model.model
-            if isinstance(vl, PeftModel):
-                peft_module = vl
-            elif hasattr(vl, "language_model") and isinstance(vl.language_model, PeftModel):
-                peft_module = vl.language_model
-            elif hasattr(vl, "visual") and isinstance(vl.visual, PeftModel):
-                peft_module = vl.visual
-
-        is_peft = peft_module is not None
-
-        if is_peft:
-            logger.info(
-                f"Detected PEFT model (peft submodule type: {type(peft_module).__name__}) - "
-                "using PeftModel.save_pretrained() for adapter weights"
-            )
-            # For PEFT models, we need to save:
-            # 1. Adapter weights using PeftModel.save_pretrained() (saves adapter_model.safetensors + adapter_config.json)
-            # 2. Custom heads (progress_head, etc.) from RBM wrapper
-            # 3. Other RBM-specific parameters (frame_pool_attn, video_proj, text_proj, etc.)
-
-            # Save adapter weights using standard PEFT method
-            logger.info("Saving PEFT adapter weights using PeftModel.save_pretrained()")
-            peft_module.save_pretrained(ckpt_dir)
-
-            # Save custom heads and other RBM-specific parameters
-            # These are not part of the PeftModel, so we save them separately
-            rbm_state_dict = {}
-            for name, param in model.named_parameters():
-                # Include custom heads and other RBM-specific parameters
-                # Exclude base model parameters (handled by PEFT) and adapter parameters (already saved)
-                if (
-                    "progress_head" in name
-                    or "preference_head" in name
-                    or "similarity_head" in name
-                    or "success_head" in name
-                ):
-                    rbm_state_dict[name] = param.data.cpu()
-                elif "frame_pool_attn" in name or "video_proj" in name or "text_proj" in name:
-                    rbm_state_dict[name] = param.data.cpu()
-
-            # Also save non-parameter buffers if any
-            for name, buffer in model.named_buffers():
-                if (
-                    "progress_head" in name
-                    or "preference_head" in name
-                    or "similarity_head" in name
-                    or "success_head" in name
-                ):
-                    rbm_state_dict[name] = buffer.cpu()
-
-            if rbm_state_dict:
-                # Save custom heads to a separate file
-                from safetensors.torch import save_file
-
-                custom_heads_path = os.path.join(ckpt_dir, "custom_heads.safetensors")
-                save_file(rbm_state_dict, custom_heads_path)
-                logger.info(f"Saved {len(rbm_state_dict)} custom head parameters to {custom_heads_path}")
-
-            # Verify that adapter weights were saved
-            adapter_config_path = os.path.join(ckpt_dir, "adapter_config.json")
-            adapter_model_paths = [
-                os.path.join(ckpt_dir, "adapter_model.safetensors"),
-                os.path.join(ckpt_dir, "adapter_model.bin"),  # Fallback to .bin if safetensors not available
-            ]
-
-            if os.path.exists(adapter_config_path):
-                logger.info(f"PEFT adapter config saved to {adapter_config_path}")
-            else:
-                logger.warning(f"PEFT adapter config not found at {adapter_config_path}")
-
-            # Check for adapter model files
-            adapter_model_found = any(os.path.exists(p) for p in adapter_model_paths)
-            if adapter_model_found:
-                adapter_path = next(p for p in adapter_model_paths if os.path.exists(p))
-                logger.info(f"PEFT adapter weights saved to {adapter_path}")
-            else:
-                logger.warning(
-                    "PEFT adapter weights file not found - adapter weights may not have been saved correctly"
-                )
-        else:
-            logger.info("Detected non-PEFT model - using standard save_model()")
-            # For non-PEFT models, use standard save_model()
-            self._trainer.save_model(ckpt_dir)
-
-        if args.should_save:
-            self._trainer.save_state()  # trainer_state.json etc. in output_dir
-            # save the trainer_state.json to the actual checkpoint directory
-            shutil.copy(os.path.join(args.output_dir, "trainer_state.json"), ckpt_dir)
-
-        # Save metrics to JSON file
-        if metrics is not None:
-            metrics_file = os.path.join(ckpt_dir, "metrics.json")
-            metrics_to_save = {
-                "step": step,
-                "metrics": {
-                    k: float(v) if isinstance(v, (int, float, np.number)) else str(v) for k, v in metrics.items()
-                },
-            }
-            with open(metrics_file, "w") as f:
-                json.dump(metrics_to_save, f, indent=2)
-            logger.info(f"📊 Saved metrics to {metrics_file}")
-
-        # Save random state from training dataset
-        if self._trainer and hasattr(self._trainer, "train_dataset"):
-            try:
-                train_dataset = self._trainer.train_dataset
-                # Handle RepeatedDataset wrapper if present
-                if hasattr(train_dataset, "dataset"):
-                    train_dataset = train_dataset.dataset
-
-                if hasattr(train_dataset, "get_random_state"):
-                    random_state = train_dataset.get_random_state()
-                    random_state_file = os.path.join(ckpt_dir, "dataset_random_state.json")
-                    with open(random_state_file, "w") as f:
-                        json.dump(random_state, f, indent=2)
-                    logger.info(f"Saved dataset random state to {random_state_file}")
-            except Exception as e:
-                logger.warning(f"Could not save random state: {e}")
+        _save_trainer_checkpoint_files(self._trainer, args, ckpt_dir, metrics=metrics, step=step)
 
     def _cleanup_memory(self):
         """Perform memory cleanup."""
@@ -528,7 +540,7 @@ class SaveBestCallback(TrainerCallback):
 
     def _upload_checkpoint_to_hub(
         self, ckpt_dir: str, hub_model_id: str, tag_name: str, commit_message: str
-    ) -> Tuple[str, str]:
+    ) -> tuple[str, str]:
         """Upload checkpoint to Hub and return URL and commit ID."""
         hub_url, commit_id = upload_model_to_hub(
             model_dir=ckpt_dir,
@@ -594,7 +606,8 @@ class SaveBestCallback(TrainerCallback):
 
             metrics_str = self._build_metrics_detail_string(metrics)
             logger.info(
-                f"💾 Saving ckpt: {ckpt_dir} | avg_score: {score_for_filename:.6f} | {metrics_str} (rank {len(self._saved) + 1}/{self.keep_top_k})"
+                f"💾 Saving ckpt: {ckpt_dir} | avg_score: {score_for_filename:.6f} | "
+                f"{metrics_str} (rank {len(self._saved) + 1}/{self.keep_top_k})"
             )
 
             # Create checkpoint directory
@@ -711,7 +724,7 @@ class SaveBestCallback(TrainerCallback):
             return
 
         # Compute score and build tag similar to best checkpoints
-        score, missing_metrics = self._compute_averaged_score(metrics)
+        score, _missing_metrics = self._compute_averaged_score(metrics)
         step = state.global_step
         metric_short = self._build_metric_short_name()
 
@@ -764,7 +777,7 @@ class SaveBestCallback(TrainerCallback):
 
             logger.info(f"🚀 Uploading 'latest' checkpoint to Hub: {hub_model_id}")
 
-            hub_url, commit_id = self._upload_checkpoint_to_hub(
+            hub_url, _commit_id = self._upload_checkpoint_to_hub(
                 ckpt_dir=ckpt_dir,
                 hub_model_id=hub_model_id,
                 tag_name=tag_name,
@@ -793,8 +806,8 @@ class SaveBestCallback(TrainerCallback):
 def load_model_from_hf(
     model_path: str,
     device: torch.device,
-    hub_token: Optional[str] = None,
-) -> Tuple[Optional[ExperimentConfig], Optional[Any], Optional[Any], Optional[Any]]:
+    hub_token: str | None = None,
+) -> tuple[ExperimentConfig | None, Any | None, Any | None, Any | None]:
     """
     Load reward model config and model from HuggingFace or local checkpoint.
 
@@ -820,7 +833,7 @@ def load_model_from_hf(
     if resolved_path is None:
         raise ValueError(f"Could not resolve checkpoint path: {model_path}")
 
-    config_path: Optional[str] = None
+    config_path: str | None = None
 
     # Parse repo_id and revision (tag) from model_path if using @tag format
     # This is used for downloading config.yaml if needed
@@ -847,8 +860,10 @@ def load_model_from_hf(
         if config_path is None:
             try:
                 from huggingface_hub import hf_hub_download
-            except ImportError:
-                raise ImportError("huggingface_hub not available. Install with: pip install huggingface_hub")
+            except ImportError as e:
+                raise ImportError(
+                    "huggingface_hub not available. Install with: pip install huggingface_hub"
+                ) from e
 
             # Check if this is a HuggingFace repo (not a local path)
             if "/" in repo_id and not repo_id.startswith("/"):
@@ -862,14 +877,16 @@ def load_model_from_hf(
                     logger.info(f"Downloaded config.yaml to: {config_path}")
                 except Exception as e:
                     logger.warning(f"Could not download config.yaml from Hub: {e}")
-                    raise ValueError(f"config.yaml not found locally and could not be downloaded from Hub: {e}")
+                    raise ValueError(
+                        f"config.yaml not found locally and could not be downloaded from Hub: {e}"
+                    ) from e
             else:
                 raise ValueError(f"config.yaml not found in checkpoint directory or parent directory: {resolved_path}")
     else:
         try:
             from huggingface_hub import hf_hub_download
-        except ImportError:
-            raise ImportError("huggingface_hub not available. Install with: pip install huggingface_hub")
+        except ImportError as e:
+            raise ImportError("huggingface_hub not available. Install with: pip install huggingface_hub") from e
         # Download config with revision if specified
         logger.info(f"Downloading config.yaml from HuggingFace Hub: {repo_id}@{revision or 'latest'}")
         config_path = hf_hub_download(repo_id=repo_id, filename="config.yaml", revision=revision, token=hub_token)
@@ -908,7 +925,7 @@ def load_model_from_hf(
     return exp_config, tokenizer, processor, reward_model
 
 
-def load_wandb_run_info(model_path: str, hub_token: Optional[str] = None) -> Optional[dict[str, Any]]:
+def load_wandb_run_info(model_path: str, hub_token: str | None = None) -> dict[str, Any] | None:
     """
     Retrieve saved wandb metadata for a checkpoint.
 
@@ -922,7 +939,7 @@ def load_wandb_run_info(model_path: str, hub_token: Optional[str] = None) -> Opt
         hub_token: Optional HuggingFace token for private repos
     """
 
-    def _load_json(path: Path) -> Optional[dict[str, Any]]:
+    def _load_json(path: Path) -> dict[str, Any] | None:
         try:
             with open(path) as f:
                 return json.load(f)

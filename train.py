@@ -1,47 +1,51 @@
 import json
 import os
-from dataclasses import asdict
 import shutil
+from dataclasses import asdict
 
+import datasets
 import torch
 import torch.distributed as dist
 import yaml
+from hydra import main as hydra_main
+from hydra.core.config_store import ConfigStore
+from omegaconf import DictConfig
+from peft import prepare_model_for_kbit_training
 from rich import print as rprint
 from rich.panel import Panel
-from omegaconf import DictConfig
-from hydra.core.config_store import ConfigStore
-from hydra import main as hydra_main
 
-from peft import prepare_model_for_kbit_training
 from robometer.configs.experiment_configs import (
+    CustomEvaluationConfig,
+    DataConfig,
     ExperimentConfig,
+    LoggingConfig,
+    LossConfig,
     ModelConfig,
     PEFTConfig,
-    DataConfig,
-    TrainingConfig,
-    LossConfig,
-    LoggingConfig,
     SaveBestConfig,
-    CustomEvaluationConfig,
+    TrainingConfig,
 )
-from robometer.trainers import ReWiNDTrainer, RBMHeadsTrainer
+from robometer.data.datasets.base import resolve_dataset_keys
 from robometer.data.datasets.helpers import show_available_datasets
-from robometer.utils.distributed import is_rank_0
-from robometer.utils.logger import rank_0_info
-from robometer.utils.timer import _timer
-from robometer.utils.save import SaveBestCallback, resolve_checkpoint_path, update_cfg_with_pretrained_ckpt
+from robometer.trainers import RBMHeadsTrainer, ReWiNDTrainer
+from robometer.utils.config_utils import convert_hydra_to_dataclass, display_config
+from robometer.utils.distributed import banner, is_rank_0
+from robometer.utils.logger import Logger, rank_0_info
+from robometer.utils.save import (
+    SaveBestCallback,
+    resolve_checkpoint_path,
+    save_final_checkpoint,
+    update_cfg_with_pretrained_ckpt,
+)
 from robometer.utils.setup_utils import (
     create_training_arguments,
+    model_has_peft,
     setup_batch_collator,
     setup_dataset,
     setup_model_and_processor,
     setup_peft_model,
 )
-from robometer.data.datasets.base import resolve_dataset_keys
-from robometer.utils.logger import Logger
-from robometer.utils.distributed import banner
-from robometer.utils.config_utils import display_config, convert_hydra_to_dataclass
-import datasets
+from robometer.utils.timer import _timer
 
 datasets.logging.set_verbosity_error()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -59,8 +63,6 @@ cs.store(group="logging", name="logging_config", node=LoggingConfig)
 cs.store(group="logging/save_best", name="save_best_config", node=SaveBestConfig)
 cs.store(group="custom_eval", name="custom_eval_config", node=CustomEvaluationConfig)
 
-
-import torch
 
 torch.set_num_threads(64)
 torch.set_num_interop_threads(8)
@@ -103,7 +105,11 @@ def train(cfg: ExperimentConfig):
 
     # Apply PEFT if enabled
     if cfg.model.use_peft:
-        peft_rbm_model = setup_peft_model(rbm_model, cfg.peft)
+        if model_has_peft(rbm_model):
+            peft_rbm_model = rbm_model
+            rank_0_info("PEFT already configured on the model; skipping re-application.")
+        else:
+            peft_rbm_model = setup_peft_model(rbm_model, cfg.peft)
     else:
         peft_rbm_model = rbm_model
         rank_0_info("PEFT not enabled, using full model")
@@ -221,7 +227,7 @@ def train(cfg: ExperimentConfig):
         train_dataset = setup_dataset(cfg.data)
         num_train_samples = len(train_dataset)
         rank_0_info(f"Training dataset created with {num_train_samples} samples")
-        rank_0_info(f"=" * 100)
+        rank_0_info("=" * 100)
 
     # Set up evaluation dataset if evaluation is enabled
     eval_dataset = None
@@ -267,7 +273,7 @@ def train(cfg: ExperimentConfig):
     rank_0_info(f"🔧 DEBUG: Trainer callbacks: {[type(cb).__name__ for cb in trainer.callback_handler.callbacks]}")
 
     metrics_info = []
-    for name, is_better in zip(save_best_cfg.metric_names, save_best_cfg.greater_is_better):
+    for name, is_better in zip(save_best_cfg.metric_names, save_best_cfg.greater_is_better, strict=False):
         direction = "↗️ higher" if is_better else "↘️ lower"
         metrics_info.append(f"{name} ({direction})")
 
@@ -314,7 +320,7 @@ def train(cfg: ExperimentConfig):
         random_state_file = os.path.join(resume_path, "dataset_random_state.json")
         if os.path.exists(random_state_file):
             try:
-                with open(random_state_file, "r") as f:
+                with open(random_state_file) as f:
                     random_state = json.load(f)
                 # Handle RepeatedDataset wrapper if present
                 train_dataset = train_dataset.dataset if hasattr(train_dataset, "dataset") else train_dataset
@@ -322,17 +328,18 @@ def train(cfg: ExperimentConfig):
                     train_dataset.set_random_state(random_state)
                     rank_0_info(f"Restored dataset random state from {random_state_file}")
                 else:
-                    rank_0_info(f"Dataset does not support random state restoration")
+                    rank_0_info("Dataset does not support random state restoration")
             except Exception as e:
                 rank_0_info(f"Could not restore random state: {e}")
         else:
-            rank_0_info(f"No dataset_random_state.json found in checkpoint, starting with fresh random state")
+            rank_0_info("No dataset_random_state.json found in checkpoint, starting with fresh random state")
 
     if cfg.debug:
         rank_0_info("🐛 DEBUG MODE: eval_steps=2, custom_eval_steps=2, eval_subset_size=10")
 
     trainer.train(resume_from_checkpoint=resume_path)
-    trainer.save_model(cfg.training.output_dir)
+    save_final_checkpoint(trainer, cfg.training.output_dir, step=trainer.state.global_step)
+    shutil.copy(os.path.join(output_dir, "config.yaml"), os.path.join(cfg.training.output_dir, "config.yaml"))
     rank_0_info(f"Training complete! Check {cfg.training.output_dir} for checkpoints and final model.")
 
 
