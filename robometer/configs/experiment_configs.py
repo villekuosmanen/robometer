@@ -298,6 +298,12 @@ class CustomEvaluationConfig:
             "help": "For RoboArena datasets: Number of total trajectories to sample using circular sampling across partial_success values. None = use num_examples_per_quality_pr per partial_success group."
         },
     )
+    confusion_matrix_n_trajectories_per_source: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of trajectories to sample per data source for confusion matrix evaluation. None = use all trajectories."
+        },
+    )
     policy_ranking_max_tasks: Optional[int] = field(
         default=100,
         metadata={

@@ -744,6 +744,8 @@ class RBMHeadsTrainer(Trainer):
         elif eval_type == "quality_preference":
             sampler_kwargs["comparisons_per_task"] = self.config.custom_eval.comparisons_per_task
             sampler_kwargs["max_comparisons"] = self.config.custom_eval.max_comparisons
+        elif eval_type == "confusion_matrix":
+            sampler_kwargs["n_trajectories_per_source"] = self.config.custom_eval.confusion_matrix_n_trajectories_per_source
 
         dataset = setup_custom_eval_dataset(
             eval_cfg, sampler_type=eval_type, verbose=False, sampler_kwargs=sampler_kwargs
@@ -1269,8 +1271,11 @@ class RBMHeadsTrainer(Trainer):
                 inner_padding=1,
             )
 
-            self.logger.log_figure(f"eval_cm/{ds_name}", confusion_plot, step=eval_step)
-            plt.close(confusion_plot)
+            if confusion_plot is not None:
+                self.logger.log_figure(f"eval_cm/{ds_name}", confusion_plot, step=eval_step)
+                plt.close(confusion_plot)
+            else:
+                logger.warning(f"No Confusion Matrix metrics computed for {ds_name}")
             # log_memory_usage(f"Before deleting confusion_matrix data")
             del confusion_plot, confusion_matrix
             confusion_plot = None

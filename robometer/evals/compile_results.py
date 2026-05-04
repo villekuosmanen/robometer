@@ -958,7 +958,7 @@ def run_confusion_matrix_eval(
                 valid_indices.append(idx)
 
     if not all_progress_preds:
-        return {"error": "No valid confusion matrix data found"}, np.zeros((1, 1))
+        return None, np.zeros((1, 1)), {}
 
     # Group results by confusion matrix task
     uniq_tasks = set(all_lang_tasks) | set(all_video_tasks)
