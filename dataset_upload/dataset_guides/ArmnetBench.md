@@ -10,9 +10,6 @@ The HF repo is versioned (`_v01`); the logical `data_source` stays `armnetbench`
 versions so it remains a single source in the training mix.
 
 - HF dataset: `https://huggingface.co/datasets/villekuosmanen/armnetbench_robometer_v01`
-- Conversion tooling (in the alpha-robotics monorepo, not in this repo):
-  `remoterobo/armnetbench/convert_eval_to_robometer.py` (LeRobot v3.0 → RBM) and
-  `remoterobo/armnetbench/compute_lang_vectors.py` (all-MiniLM-L6-v2 `lang_vector`).
 
 ## Overview
 
@@ -22,7 +19,6 @@ versions so it remains a single source in the training mix.
 - `quality_label`: teleop → `successful`; policy rollouts → `successful` / `failure` /
   `suboptimal` (from the per-episode eval labels). No numeric `partial_success` — text
   classes only, so failures/suboptimals pair against same-task teleop successes.
-- Task instruction is overridden per `task_id` (not the source dataset's task text).
 - Successful/suboptimal episodes are trimmed to a labelled completion time, removing trailing
   idle frames so the positional progress target ramps to actual task completion.
 - Videos: H.264, shortest edge 240 — matching the other RBM datasets.
